@@ -233,13 +233,18 @@ int main(){
             printf("Exiting program.\n");
             exit(0);
         }
-
-        char source[PATH_MAX], target[PATH_MAX];
-        if(sscanf(cmd, "add %s %s", source, target) == 2){
+        int argc = 0;
+        char* argv[64];
+        char* tok = strtok(cmd, " \n");
+        while(tok != NULL && argc < 64){
+            argv[argc++] = tok;
+            tok = strtok(NULL, " \n");
+        }
+        if(argc >= 3 && strcmp(argv[0], "add") == 0){
+            char* source = argv[1];
             char real_source[PATH_MAX], real_target[PATH_MAX];
 
             //          INIT CHECK
-
 
             if (!realpath(source, real_source)) {
                 fprintf(stderr, "Source does not exist!\n");
@@ -251,41 +256,44 @@ int main(){
                 continue;
             }
 
-            if (mkdir(target, 0777) == -1 && errno != EEXIST) {
-                ERR("mkdir");
-            }
+            for(int i = 2; i < argc;i++){
+                char* target = argv[i];
+                if (mkdir(target, 0777) == -1 && errno != EEXIST) {
+                    ERR("mkdir");
+                }
 
-            if (!realpath(target, real_target)) {
-                ERR("realpath");
-            }
-            
-            if(!isDirectoryEmpty(real_target)){
-                fprintf(stderr, "target directory must be empty!\n");
-                continue;
-            }
+                if (!realpath(target, real_target)) {
+                    ERR("realpath");
+                }
+                
+                if(!isDirectoryEmpty(real_target)){
+                    fprintf(stderr, "target directory must be empty!\n");
+                    continue;
+                }
 
-            //              INIT COPY
+                //              INIT COPY
 
-            printf("Starting backup...\n");
-            copy_recursive(real_source, real_target, real_source, real_target);
-            printf("Backup complete.\n");
-            
+                printf("Starting backup...\n");
+                copy_recursive(real_source, real_target, real_source, real_target);
+                printf("Backup complete.\n");
+                
 
 
-            //           MONITORING INIT
-            //https://gist.github.com/jaypeche/213df41e930860802cb5
-            //          |
-            //          |
-            //          V
-            pid_t pid = fork();
-            if(pid == 0){
-                child_work(real_source, real_target);
-            }
-            else if(pid > 0){
-                children[child_count++] = pid;
-            }
-            else{
-                ERR("fork");
+                //           MONITORING INIT
+                //https://gist.github.com/jaypeche/213df41e930860802cb5
+                //          |
+                //          |
+                //          V
+                pid_t pid = fork();
+                if(pid == 0){
+                    child_work(real_source, real_target);
+                }
+                else if(pid > 0){
+                    children[child_count++] = pid;
+                }
+                else{
+                    ERR("fork");
+                }
             }
         }
     }    
