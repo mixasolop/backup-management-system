@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/inotify.h>
 #include <limits.h>
@@ -20,6 +21,29 @@
 #endif
 #define MAX_CHILDREN 128
 
+typedef struct {
+    pid_t pid;
+    char target[PATH_MAX];
+} child_info;
+
+volatile sig_atomic_t last_signal = 0;
+
+void sethandler(void (*f)(int), int sigNo)
+{
+    struct sigaction act;
+    memset(&act, 0, sizeof(struct sigaction));
+    act.sa_handler = f;
+    if (-1 == sigaction(sigNo, &act, NULL))
+        ERR("sigaction");
+}
+
+void sig_handler(int sig) {last_signal = sig;}
+
+void sigchld_handler(int sig)
+{
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
 
 void usage(int argc, char* argv[])
 {
@@ -135,103 +159,147 @@ void copy_recursive(const char *src, const char *target, const char *src_root, c
 }
 
 void child_work(char* real_source, char* real_target){
+    sethandler(sig_handler, SIGINT);
+    sethandler(sig_handler, SIGTERM);
+
+    sigset_t sig_mask;
+    sigfillset(&sig_mask);
+    sigdelset(&sig_mask, SIGINT);
+    sigdelset(&sig_mask, SIGTERM);
+    sigdelset(&sig_mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &sig_mask, NULL);
     int fd = inotify_init();
-                if (fd < 0) 
-                    ERR("inotify_init");
+    if (fd < 0) {
+        ERR("inotify_init");}
 
-                uint32_t mask = IN_CREATE | IN_MODIFY | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO;
-                int wd = inotify_add_watch(fd, real_source, mask);
-                if (wd < 0) 
-                    ERR("inotify_add_watch");
+    uint32_t mask = IN_CREATE | IN_MODIFY | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED;
+    int wd = inotify_add_watch(fd, real_source, mask);
+    if (wd < 0) 
+        ERR("inotify_add_watch");
 
-                char buf[65536];
+    char buf[65536];
+    int to_exit = 0;
+    while(!to_exit) {
+        if (last_signal == SIGINT || last_signal == SIGTERM) {
+            to_exit = 1;
+            break;
+        }
+        ssize_t len = read(fd, buf, sizeof(buf));
+        if (len < 0){ 
+            if (errno == EINTR){
+                continue;}
+            ERR("read");}
 
-                while(1) {
-                    ssize_t len = read(fd, buf, sizeof(buf));
-                    if (len < 0) 
-                        ERR("read");
+        ssize_t i = 0;
+        while (i < len) {
+            struct inotify_event *event = (struct inotify_event *)&buf[i];
 
-                    ssize_t i = 0;
-                    while (i < len) {
-                        struct inotify_event *event = (struct inotify_event *)&buf[i];
+            if ((event->mask & IN_CREATE) || (event->mask & IN_MOVED_TO)) {
 
-                        if ((event->mask & IN_CREATE) || (event->mask & IN_MOVED_TO)) {
+                if (event->len > 0) {
+                    char source_path[PATH_MAX];
+                    char target_path[PATH_MAX];
 
-                            if (event->len > 0) {
-                                char source_path[PATH_MAX];
-                                char target_path[PATH_MAX];
+                    snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
+                    snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
 
-                                snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
-                                snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
-
-                                struct stat st1;
-                                if (lstat(source_path, &st1) == -1) 
-                                    ERR("lstat");
-                                else {
-                                    if (S_ISDIR(st1.st_mode)) {
-                                        if (mkdir(target_path, st1.st_mode & 0777) == -1)
-                                            perror("mkdir(IN_CREATE)");} 
-                                    else if (S_ISREG(st1.st_mode)) 
-                                        copy_file(source_path, target_path);
-                                    else if (S_ISLNK(st1.st_mode)) 
-                                        copy_symlink(source_path, target_path, real_source, real_target);
-                                }
-                            }
-                        }
-
-                        if ((event->mask & IN_DELETE) || (event->mask & IN_MOVED_FROM)){
-                            char target_path[PATH_MAX];
-
-                            snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
-                            if(unlink(target_path) == -1)
-                                if(remove(target_path) == -1)
-                                        if(rmdir(target_path) == -1)
-                                                ERR("rmdir");}
-
-                        if ((event->mask & IN_MODIFY)){
-                            char source_path[PATH_MAX];
-                            char target_path[PATH_MAX];
-
-                            snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
-                            snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
-                            
-                            struct stat st2;
-
-                            if (lstat(source_path, &st2) == -1) 
-                                    ERR("lstat");
-                                else {
-                                    if(S_ISREG(st2.st_mode)){
-                                        copy_file(source_path, target_path);
-                                    }
-                                }
-                        }
-
-                        i += (ssize_t)sizeof(struct inotify_event) + event->len;
+                    struct stat st1;
+                    if (lstat(source_path, &st1) == -1) 
+                        ERR("lstat");
+                    else {
+                        if (S_ISDIR(st1.st_mode)) {
+                            if (mkdir(target_path, st1.st_mode & 0777) == -1)
+                                perror("mkdir(IN_CREATE)");} 
+                        else if (S_ISREG(st1.st_mode)) 
+                            copy_file(source_path, target_path);
+                        else if (S_ISLNK(st1.st_mode)) 
+                            copy_symlink(source_path, target_path, real_source, real_target);
                     }
                 }
-                exit(0);
+            }
+
+            if ((event->mask & IN_DELETE) || (event->mask & IN_MOVED_FROM)){
+                char target_path[PATH_MAX];
+
+                snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
+                if(unlink(target_path) == -1)
+                    if(remove(target_path) == -1)
+                            if(rmdir(target_path) == -1)
+                                    ERR("rmdir");}
+
+            if ((event->mask & IN_MODIFY)){
+                char source_path[PATH_MAX];
+                char target_path[PATH_MAX];
+
+                snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
+                snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
+                
+                struct stat st2;
+
+                if (lstat(source_path, &st2) == -1) 
+                        ERR("lstat");
+                    else {
+                        if(S_ISREG(st2.st_mode)){
+                            copy_file(source_path, target_path);
+                        }
+                    }
+            }
+
+            if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
+                to_exit = 1;
+                break;
+            }
+
+
+            i += (ssize_t)sizeof(struct inotify_event) + event->len;
+        }
+    }
+    inotify_rm_watch(fd, wd);
+    close(fd);
+    exit(0);
 }
 
-
-int main(){
-    char cmd[4096];
-    pid_t children[MAX_CHILDREN];
-    int child_count = 0;
-    while(1){
-
-        if (!fgets(cmd, sizeof(cmd), stdin)) 
-            break;
-        //          EXIT
-        if (strncmp(cmd, "exit", 4) == 0) {
-            for (int i = 0; i < child_count; i++) {
-                kill(children[i], SIGTERM);
+void exit_fun(child_info* children, int child_count){
+    for (int i = 0; i < child_count; i++) {
+                kill(children[i].pid, SIGTERM);
             }
             for (int i = 0; i < child_count; i++) {
-                waitpid(children[i], NULL, 0);
+                waitpid(children[i].pid, NULL, 0);
             }
 
             printf("Exiting program.\n");
             exit(0);
+}
+
+int main(){
+    sethandler(sig_handler, SIGINT);
+    sethandler(sig_handler, SIGTERM);
+
+    sigset_t sig_mask;
+    sigfillset(&sig_mask);
+    sigdelset(&sig_mask, SIGINT);
+    sigdelset(&sig_mask, SIGTERM);
+    sigdelset(&sig_mask, SIGCHLD);
+    sethandler(sigchld_handler, SIGCHLD);
+
+    sigprocmask(SIG_BLOCK, &sig_mask, NULL);
+    char cmd[4096];
+
+    child_info children[MAX_CHILDREN];
+    int child_count = 0;
+    char curr_source[PATH_MAX];
+    while(1){
+        if (last_signal == SIGINT || last_signal == SIGTERM) {
+            
+            break;
+        }
+        if (!fgets(cmd, sizeof(cmd), stdin)){
+            if (errno == EINTR){
+                continue;}
+            break;}
+        //          EXIT
+        if (strncmp(cmd, "exit", 4) == 0) {
+            exit_fun(children, child_count);
         }
         int argc = 0;
         char* argv[64];
@@ -241,6 +309,16 @@ int main(){
             tok = strtok(NULL, " \n");
         }
         if(argc >= 3 && strcmp(argv[0], "add") == 0){
+            int counter_of_dup_targets = 0;
+            for(int i = 0; i < argc; i++){
+                for(int j = 0; j < argc; j++){
+                    if(i != j && strcmp(argv[i], argv[j]) == 0){
+                        counter_of_dup_targets++;
+                    }
+                }
+            }
+            if(counter_of_dup_targets > 1)
+                break;
             char* source = argv[1];
             char real_source[PATH_MAX], real_target[PATH_MAX];
 
@@ -255,6 +333,8 @@ int main(){
                 fprintf(stderr, "Source is not a directory!\n");
                 continue;
             }
+            strncpy(curr_source, real_source, PATH_MAX - 1);
+            curr_source[PATH_MAX - 1] = '\0';
 
             for(int i = 2; i < argc;i++){
                 char* target = argv[i];
@@ -264,6 +344,11 @@ int main(){
 
                 if (!realpath(target, real_target)) {
                     ERR("realpath");
+                }
+
+                if(strncmp(real_source, real_target, strlen(real_source)) == 0 && (real_target[strlen(real_source)] == '/' || real_target[strlen(real_source)] == '\0')){
+                    fprintf(stderr, "target can NOT be in source!!");
+                    continue;
                 }
                 
                 if(!isDirectoryEmpty(real_target)){
@@ -289,12 +374,55 @@ int main(){
                     child_work(real_source, real_target);
                 }
                 else if(pid > 0){
-                    children[child_count++] = pid;
+                        children[child_count].pid = pid;
+                        strncpy(children[child_count].target, real_target, PATH_MAX - 1);
+                        children[child_count].target[PATH_MAX - 1] = '\0';
+                        child_count++;
                 }
                 else{
                     ERR("fork");
                 }
             }
         }
+        if (argc == 1 && strcmp(argv[0], "list") == 0) {
+            if (child_count == 0) {
+                printf("No active backups.\n");
+                continue;
+            }
+
+            printf("SOURCE: %s->\n", curr_source);
+            for (int i = 0; i < child_count; i++) {
+                printf("\t%s\n", children[i].target);
+            }
+            continue;
+        }
+
+
+        if (argc >= 3 && strcmp(argv[0], "end") == 0) {
+            char real_target[PATH_MAX];
+
+            for (int i = 2; i < argc; i++) {
+                if (!realpath(argv[i], real_target)) {
+                    continue;
+                }
+
+                for (int j = 0; j < child_count; j++) {
+                    if (strcmp(children[j].target, real_target) == 0) {
+
+                        /* stop monitoring */
+                        kill(children[j].pid, SIGTERM);
+                        waitpid(children[j].pid, NULL, 0);
+
+                        /* remove from list */
+                        printf("backuping into %s was stopped :(\n", children[j].target);
+                        children[j] = children[child_count - 1];
+                        child_count--;
+
+                        break;
+                    }
+                }
+            }
+        }
     }    
+    exit_fun(children, child_count);
 }
