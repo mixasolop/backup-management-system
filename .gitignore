@@ -1,5 +1,5 @@
 *.o
 sop-backup
 Makefile
-backup/
-from_backup/
+*/
+!src/

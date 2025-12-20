@@ -26,6 +26,61 @@ typedef struct {
     char target[PATH_MAX];
 } child_info;
 
+struct Watch {
+    int wd;
+    char *path;
+};
+
+struct WatchMap {
+    struct Watch watch_map[128];
+    int watch_count;
+};
+
+void add_to_map(struct WatchMap *map, int wd, const char *path) {
+    map->watch_map[map->watch_count].wd = wd;
+    map->watch_map[map->watch_count].path = strdup(path);
+    map->watch_count++;
+}
+
+struct Watch *find_watch(struct WatchMap *map, int wd) {
+    for (int i = 0; i < map->watch_count; i++)
+        if (map->watch_map[i].wd == wd)
+            return &map->watch_map[i];
+    return NULL;
+}
+
+void add_watch_recursive(int fd, struct WatchMap *map, const char *base_path) {
+    uint32_t mask = IN_CREATE | IN_MODIFY | IN_DELETE |
+                    IN_MOVED_FROM | IN_MOVED_TO |
+                    IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED;
+
+    int wd = inotify_add_watch(fd, base_path, mask);
+    if (wd < 0)
+        ERR("inotify_add_watch");
+
+    add_to_map(map, wd, base_path);
+
+    DIR *dir = opendir(base_path);
+    if (!dir) return;
+
+    struct dirent *e;
+    while ((e = readdir(dir)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", base_path, e->d_name);
+
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            add_watch_recursive(fd, map, path);
+        }
+    }
+    closedir(dir);
+}
+
+
+
 volatile sig_atomic_t last_signal = 0;
 
 void sethandler(void (*f)(int), int sigNo)
@@ -171,14 +226,13 @@ void child_work(char* real_source, char* real_target){
     int fd = inotify_init();
     if (fd < 0) {
         ERR("inotify_init");}
+    struct WatchMap map = {0};
+    add_watch_recursive(fd, &map, real_source);
 
-    uint32_t mask = IN_CREATE | IN_MODIFY | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED;
-    int wd = inotify_add_watch(fd, real_source, mask);
-    if (wd < 0) 
-        ERR("inotify_add_watch");
 
     char buf[65536];
     int to_exit = 0;
+
     while(!to_exit) {
         if (last_signal == SIGINT || last_signal == SIGTERM) {
             to_exit = 1;
@@ -193,47 +247,47 @@ void child_work(char* real_source, char* real_target){
         ssize_t i = 0;
         while (i < len) {
             struct inotify_event *event = (struct inotify_event *)&buf[i];
+            struct Watch *w = find_watch(&map, event->wd);
+            
+            
+            char source_path[PATH_MAX];
+            char target_path[PATH_MAX];
+            if (event->len > 0) {
+                snprintf(source_path, sizeof(source_path), "%s/%s", w->path, event->name);
+
+                snprintf(target_path, sizeof(target_path), "%s%s", real_target, source_path + strlen(real_source));
+            } 
+            else {
+                strncpy(source_path, w->path, PATH_MAX);
+                snprintf(target_path, sizeof(target_path), "%s%s", real_target, source_path + strlen(real_source));
+            }
 
             if ((event->mask & IN_CREATE) || (event->mask & IN_MOVED_TO)) {
 
                 if (event->len > 0) {
-                    char source_path[PATH_MAX];
-                    char target_path[PATH_MAX];
-
-                    snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
-                    snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
-
                     struct stat st1;
                     if (lstat(source_path, &st1) == -1) 
                         ERR("lstat");
-                    else {
-                        if (S_ISDIR(st1.st_mode)) {
-                            if (mkdir(target_path, st1.st_mode & 0777) == -1)
-                                perror("mkdir(IN_CREATE)");} 
-                        else if (S_ISREG(st1.st_mode)) 
-                            copy_file(source_path, target_path);
-                        else if (S_ISLNK(st1.st_mode)) 
-                            copy_symlink(source_path, target_path, real_source, real_target);
-                    }
+                    if (S_ISDIR(st1.st_mode)) {
+                        if (mkdir(target_path, st1.st_mode & 0777) == -1){
+                            perror("mkdir(IN_CREATE)");}
+                        add_watch_recursive(fd, &map, source_path);     
+                        } 
+                        
+                    else if (S_ISREG(st1.st_mode)) 
+                        copy_file(source_path, target_path);
+                    else if (S_ISLNK(st1.st_mode)) 
+                        copy_symlink(source_path, target_path, real_source, real_target);
                 }
             }
 
             if ((event->mask & IN_DELETE) || (event->mask & IN_MOVED_FROM)){
-                char target_path[PATH_MAX];
-
-                snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
                 if(unlink(target_path) == -1)
                     if(remove(target_path) == -1)
                             if(rmdir(target_path) == -1)
                                     ERR("rmdir");}
 
-            if ((event->mask & IN_MODIFY)){
-                char source_path[PATH_MAX];
-                char target_path[PATH_MAX];
-
-                snprintf(source_path, sizeof(source_path), "%s/%s", real_source, event->name);
-                snprintf(target_path, sizeof(target_path), "%s/%s", real_target, event->name);
-                
+            if ((event->mask & IN_MODIFY)){ 
                 struct stat st2;
 
                 if (lstat(source_path, &st2) == -1) 
@@ -251,13 +305,47 @@ void child_work(char* real_source, char* real_target){
             }
 
 
-            i += (ssize_t)sizeof(struct inotify_event) + event->len;
+            i += sizeof(struct inotify_event) + event->len;
         }
     }
-    inotify_rm_watch(fd, wd);
     close(fd);
     exit(0);
 }
+
+int parse_args(char *line, char *argv[])
+{
+    int argc = 0;
+    char *p = line;
+
+    while (*p && argc < 64) {
+        while (*p == ' ' || *p == '\n' || *p == '\t')
+            p++;
+
+        if (*p == '\0')
+            break;
+
+        if (*p == '"') {
+            p++;
+            argv[argc++] = p;
+            while (*p && *p != '"')
+                p++;
+            if (*p == '"') {
+                *p = '\0';
+                p++;
+            }
+        } else {
+            argv[argc++] = p;
+            while (*p && *p != ' ' && *p != '\n' && *p != '\t')
+                p++;
+            if (*p) {
+                *p = '\0';
+                p++;
+            }
+        }
+    }
+    return argc;
+}
+
 
 void exit_fun(child_info* children, int child_count){
     for (int i = 0; i < child_count; i++) {
@@ -301,23 +389,31 @@ int main(){
         if (strncmp(cmd, "exit", 4) == 0) {
             exit_fun(children, child_count);
         }
-        int argc = 0;
         char* argv[64];
-        char* tok = strtok(cmd, " \n");
-        while(tok != NULL && argc < 64){
-            argv[argc++] = tok;
-            tok = strtok(NULL, " \n");
-        }
+        int argc = parse_args(cmd, argv);
         if(argc >= 3 && strcmp(argv[0], "add") == 0){
+            char real_target_check[PATH_MAX];
             int counter_of_dup_targets = 0;
-            for(int i = 0; i < argc; i++){
+            for(int i = 2; i < argc; i++){
+                if (mkdir(argv[i], 0777) == -1 && errno != EEXIST) {
+                    ERR("mkdir");
+                }
+                if(!realpath(argv[i], real_target_check)){
+                    ERR("realpath");
+                }
+                for(int k = 0; k < child_count;k++){
+                    if(strcmp(real_target_check, children[k].target) == 0){
+                        fprintf(stderr, "CANT REPEAT TARGET!");
+                        counter_of_dup_targets++;
+                    }
+                }
                 for(int j = 0; j < argc; j++){
                     if(i != j && strcmp(argv[i], argv[j]) == 0){
                         counter_of_dup_targets++;
                     }
                 }
             }
-            if(counter_of_dup_targets > 1)
+            if(counter_of_dup_targets != 0)
                 break;
             char* source = argv[1];
             char real_source[PATH_MAX], real_target[PATH_MAX];
@@ -338,9 +434,6 @@ int main(){
 
             for(int i = 2; i < argc;i++){
                 char* target = argv[i];
-                if (mkdir(target, 0777) == -1 && errno != EEXIST) {
-                    ERR("mkdir");
-                }
 
                 if (!realpath(target, real_target)) {
                     ERR("realpath");
