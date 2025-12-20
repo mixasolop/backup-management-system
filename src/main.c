@@ -300,8 +300,8 @@ void child_work(char* real_source, char* real_target){
             }
 
             if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
-                to_exit = 1;
-                break;
+                    close(fd);
+                    exit(0);
             }
 
 
@@ -376,6 +376,7 @@ int main(){
     child_info children[MAX_CHILDREN];
     int child_count = 0;
     char curr_source[PATH_MAX];
+    printf("Available commands:\n\t->add <souce path> <target path> - start monitoring and backing up source directory\n\t->end <source path> <target path> - stop monetring source directory\n\t->list - list currently monitoring directories\n\t->restore <source path> <target path> - restores files in souce dir form the last backup\n\t->exit - terminate all monitorings\n");
     while(1){
         if (last_signal == SIGINT || last_signal == SIGTERM) {
             
