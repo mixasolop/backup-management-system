@@ -36,6 +36,14 @@ struct WatchMap {
     int watch_count;
 };
 
+
+typedef struct {
+    char src[PATH_MAX];
+    char target[PATH_MAX];
+    pid_t pid;
+    int active;
+} Backup;
+
 void add_to_map(struct WatchMap *map, int wd, const char *path) {
     map->watch_map[map->watch_count].wd = wd;
     map->watch_map[map->watch_count].path = strdup(path);
@@ -213,6 +221,121 @@ void copy_recursive(const char *src, const char *target, const char *src_root, c
     }
 }
 
+void restore_recursive(const char *src, const char* target, const char *src_root, const char *target_root){
+    struct stat st;
+    struct stat st_src;
+    if(lstat(target, &st) == -1)
+        ERR("lstat");
+    if(lstat(src, &st_src) == -1 && errno != ENOENT)
+        ERR("lstat");
+    if (lstat(src, &st_src) == 0 &&
+        (st_src.st_mode & S_IFMT) != (st.st_mode & S_IFMT)) {
+        unlink(src);
+        rmdir(src);
+    }
+
+    if(S_ISREG(st.st_mode)){
+        if (lstat(src, &st_src) == -1 && errno == ENOENT) {
+            copy_file(target, src);
+            return;
+        }
+
+        int fd_target = open(target, O_RDONLY);
+        int fd_source = open(src, O_RDONLY);
+        if(fd_target == -1 || fd_source == -1){
+            ERR("open");
+        }
+        char c_target, c_src;
+        while(1){
+            ssize_t len_target = read(fd_target, &c_target, 1);
+            ssize_t len_source = read(fd_source, &c_src, 1);
+
+            if(len_source == -1 || len_target == -1){
+                ERR("read");
+            }
+
+            if(len_source == 0 && len_target == 0){
+                break;
+            }
+            if(c_target != c_src || len_source != len_target){
+                close(fd_target);
+                close(fd_source);
+                copy_file(target, src);
+                return;
+            }
+        }
+        // TOADD condtion or print when they identical
+        close(fd_target);
+        close(fd_source);
+        return;
+    }
+    if(S_ISLNK(st.st_mode)){
+        char linkbuf_src[PATH_MAX];
+        char linkbuf_target[PATH_MAX];
+        ssize_t len_src = readlink(src, linkbuf_src, sizeof(linkbuf_src)-1);
+        ssize_t len_target = readlink(target, linkbuf_target, sizeof(linkbuf_target)-1);
+        if (len_src == -1 && (errno == ENOENT || errno == EINVAL)){
+            unlink(src);
+            copy_symlink(target, src, target_root, src_root);
+            return;
+        }
+        if (len_src == -1 || len_target == -1) 
+            ERR("readlink");
+        linkbuf_src[len_src] = '\0';
+        linkbuf_target[len_target] = '\0';
+
+        if(len_src != len_target || strcmp(linkbuf_src, linkbuf_target) != 0){
+            unlink(src);
+            copy_symlink(target, src, target_root, src_root);
+        }
+        return;
+    }
+
+    if(S_ISDIR(st.st_mode)){
+        if(mkdir(src, 0777) == -1 && errno != EEXIST)
+            ERR("mkdir");
+        
+        DIR *dir = opendir(target);
+        if(dir == NULL)
+            ERR("opendir");
+        
+        struct dirent *e;
+        char src_path[PATH_MAX], target_path[PATH_MAX];
+
+        while ((e = readdir(dir)) != NULL){
+            if(strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+
+
+            snprintf(src_path, sizeof(src_path), "%s/%s", src, e->d_name);
+            snprintf(target_path, sizeof(target_path), "%s/%s", target, e->d_name);
+            
+
+            restore_recursive(src_path, target_path, src_root, target_root);
+        }
+        closedir(dir);
+
+        DIR *dir_src = opendir(src);
+        if (!dir_src)
+            ERR("opendir");
+
+        while ((e = readdir(dir_src)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+
+            snprintf(src_path, sizeof(src_path), "%s/%s", src, e->d_name);
+            snprintf(target_path, sizeof(target_path), "%s/%s", target, e->d_name);
+
+            if (lstat(target_path, &st) == -1 && errno == ENOENT) {
+                unlink(src);
+                copy_symlink(target, src, target_root, src_root);
+                return;
+            }
+        }
+        closedir(dir_src);
+    }
+}
+
 void child_work(char* real_source, char* real_target){
     sethandler(sig_handler, SIGINT);
     sethandler(sig_handler, SIGTERM);
@@ -254,7 +377,6 @@ void child_work(char* real_source, char* real_target){
             char target_path[PATH_MAX];
             if (event->len > 0) {
                 snprintf(source_path, sizeof(source_path), "%s/%s", w->path, event->name);
-
                 snprintf(target_path, sizeof(target_path), "%s%s", real_target, source_path + strlen(real_source));
             } 
             else {
@@ -292,16 +414,16 @@ void child_work(char* real_source, char* real_target){
 
                 if (lstat(source_path, &st2) == -1) 
                         ERR("lstat");
-                    else {
-                        if(S_ISREG(st2.st_mode)){
-                            copy_file(source_path, target_path);
-                        }
+                else {
+                    if(S_ISREG(st2.st_mode)){
+                        copy_file(source_path, target_path);
                     }
+                }
             }
 
             if (event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
-                    close(fd);
-                    exit(0);
+                    to_exit = 1;
+                    break;
             }
 
 
@@ -318,7 +440,7 @@ int parse_args(char *line, char *argv[])
     char *p = line;
 
     while (*p && argc < 64) {
-        while (*p == ' ' || *p == '\n' || *p == '\t')
+        while (*p == ' ' || *p == '\n')
             p++;
 
         if (*p == '\0')
@@ -335,7 +457,7 @@ int parse_args(char *line, char *argv[])
             }
         } else {
             argv[argc++] = p;
-            while (*p && *p != ' ' && *p != '\n' && *p != '\t')
+            while (*p && *p != ' ' && *p != '\n')
                 p++;
             if (*p) {
                 *p = '\0';
@@ -376,7 +498,14 @@ int main(){
     child_info children[MAX_CHILDREN];
     int child_count = 0;
     char curr_source[PATH_MAX];
-    printf("Available commands:\n\t->add <souce path> <target path> - start monitoring and backing up source directory\n\t->end <source path> <target path> - stop monetring source directory\n\t->list - list currently monitoring directories\n\t->restore <source path> <target path> - restores files in souce dir form the last backup\n\t->exit - terminate all monitorings\n");
+    Backup backups[64];
+    static int backup_count = 0;
+
+    printf("Available commands:\n\t->add <souce path> <target path> - start monitoring and backing up source directory\n\t"
+        "->end <source path> <target path> - stop monetring source directory\n\t"
+        "->list - list currently monitoring directories\n\t"
+        "->restore <source path> <target path> - restores files in souce dir form the last backup\n\t"
+        "->exit - terminate all monitorings\n");
     while(1){
         if (last_signal == SIGINT || last_signal == SIGTERM) {
             
@@ -386,13 +515,14 @@ int main(){
             if (errno == EINTR){
                 continue;}
             break;}
+        char* argv[64];
+        int argc = parse_args(cmd, argv);
         //          EXIT
         if (strncmp(cmd, "exit", 4) == 0) {
             exit_fun(children, child_count);
         }
-        char* argv[64];
-        int argc = parse_args(cmd, argv);
-        if(argc >= 3 && strcmp(argv[0], "add") == 0){
+        //          ADD
+        else if(argc >= 3 && strcmp(argv[0], "add") == 0){
             char real_target_check[PATH_MAX];
             int counter_of_dup_targets = 0;
             for(int i = 2; i < argc; i++){
@@ -468,54 +598,101 @@ int main(){
                     child_work(real_source, real_target);
                 }
                 else if(pid > 0){
-                        children[child_count].pid = pid;
-                        strncpy(children[child_count].target, real_target, PATH_MAX - 1);
-                        children[child_count].target[PATH_MAX - 1] = '\0';
-                        child_count++;
+                    children[child_count].pid = pid;
+                    strncpy(children[child_count].target, real_target, PATH_MAX - 1);
+                    children[child_count].target[PATH_MAX - 1] = '\0';
+                    child_count++;
+                    if(backup_count<64){
+                        strcpy(backups[backup_count].src, real_source);
+                        strcpy(backups[backup_count].target, real_target);
+                        backups[backup_count].pid = pid;
+                        backups[backup_count].active = 1;
+                        backup_count++;
+                    }
+                    else{
+                        fprintf(stderr, "too many backups at once");
+                        continue;
+                    }
                 }
                 else{
                     ERR("fork");
                 }
             }
         }
-        if (argc == 1 && strcmp(argv[0], "list") == 0) {
-            if (child_count == 0) {
-                printf("No active backups.\n");
-                continue;
-            }
-
-            printf("SOURCE: %s->\n", curr_source);
-            for (int i = 0; i < child_count; i++) {
-                printf("\t%s\n", children[i].target);
+        //          LIST
+        else if (argc == 1 && strcmp(argv[0], "list") == 0) {
+            int printed[64] = {0};
+            for (int i = 0; i < backup_count; i++) {
+                if (backups[i].active && !printed[i]) {
+                    printf("SOURCE: %s\n", backups[i].src);
+                    for(int j = 0; j < backup_count; j++){
+                        if(strcmp(backups[i].src, backups[j].src) == 0 && backups[j].active == 1){
+                            printf("\t-> %s\n", backups[j].target);
+                            printed[j] = 1;
+                        }
+                    }
+                }
             }
             continue;
         }
-
-
-        if (argc >= 3 && strcmp(argv[0], "end") == 0) {
+        //          END
+        else if (argc >= 3 && strcmp(argv[0], "end") == 0) {
+            char real_source[PATH_MAX];
             char real_target[PATH_MAX];
-
+            if (!realpath(argv[1], real_source)) {
+                fprintf(stderr, "Source does not exist\n");
+                continue;
+            }
             for (int i = 2; i < argc; i++) {
                 if (!realpath(argv[i], real_target)) {
                     continue;
                 }
+                int exist = 0;
+                for (int j = 0; j < backup_count; j++) {
+                    if(backups[j].active == 1 && strcmp(backups[j].src, real_source) == 0 && strcmp(backups[j].target, real_target) == 0){
+                        kill(backups[j].pid, SIGTERM);
+                        waitpid(backups[j].pid, NULL, 0);
 
-                for (int j = 0; j < child_count; j++) {
-                    if (strcmp(children[j].target, real_target) == 0) {
+                        backups[j].active = 0;
+                        exist = 1;
 
-                        /* stop monitoring */
-                        kill(children[j].pid, SIGTERM);
-                        waitpid(children[j].pid, NULL, 0);
-
-                        /* remove from list */
-                        printf("backuping into %s was stopped :(\n", children[j].target);
-                        children[j] = children[child_count - 1];
-                        child_count--;
-
-                        break;
+                        printf("backuping %s -> %s was stopped :(\n", backups[j].src, backups[j].target);
                     }
                 }
+                if(exist == 0){
+                    fprintf(stderr, "No active backup for %s -> %s\n",real_source, real_target);
+                }
             }
+        }
+        //          RESTORE
+        else if(argc == 3 && strcmp(argv[0], "restore") == 0){
+            char real_target[PATH_MAX];
+            char real_src[PATH_MAX];
+            if (!realpath(argv[1], real_src)) {
+                ERR("realpath");
+            }   
+            if(!realpath(argv[2], real_target)){
+                ERR("realpath");
+            }
+                struct stat st;
+            if (stat(real_target, &st) == -1 || !S_ISDIR(st.st_mode)) {
+                fprintf(stderr, "Target is not a directory!\n");
+                continue;
+            }
+
+            printf("Restoring backup...\n");
+
+            restore_recursive(real_src, real_target, real_src, real_target);
+
+            printf("Restore complete.\n");
+        }
+        else{
+            printf("Wrong command, please select one of the following:");
+            printf("\n\t->add <souce path> <target path> - start monitoring and backing up source directory\n\t"
+        "->end <source path> <target path> - stop monetring source directory\n\t"
+        "->list - list currently monitoring directories\n\t"
+        "->restore <source path> <target path> - restores files in souce dir form the last backup\n\t"
+        "->exit - terminate all monitorings\n");
         }
     }    
     exit_fun(children, child_count);
